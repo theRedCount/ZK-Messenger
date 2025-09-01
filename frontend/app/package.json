@@ -17,6 +17,7 @@
     "@noble/curves": "^2.0.0",
     "@reduxjs/toolkit": "^2.8.2",
     "argon2-browser": "^1.18.0",
+    "framer-motion": "^12.23.12",
     "libsodium-wrappers": "^0.7.15",
     "react": "^19.1.1",
     "react-dom": "^19.1.1",
