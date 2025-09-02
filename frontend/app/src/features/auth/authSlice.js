@@ -11,25 +11,26 @@ import {
   unsealMasterWithDet,
   deriveRuntimeFromMaster
 } from "../../lib/crypto";
+import { addLog } from "../logs/logSlice";
+
 
 // ---------------- REGISTER ----------------
 export const registerUser = createAsyncThunk(
   "auth/registerUser",
-  async ({ email, password }, { rejectWithValue }) => {
+  async ({ email, password }, { dispatch, rejectWithValue }) => {
     try {
+      dispatch(addLog({ level: "info", msg: "Registration started", data: { email } }));
       await readySodium();
 
-      // 1) Deterministic keys (login)
       const det = await deriveDeterministic(email, password);
+      dispatch(addLog({ level: "debug", msg: "Deterministic keys derived" }));
 
-      // 2) Registration-random master & messaging keys
       const reg = await deriveRegistrationRandom();
+      dispatch(addLog({ level: "debug", msg: "Random registration keys derived" }));
 
-      // 3) Seal master_random to deterministic X25519 public
       const c_master = sealToX25519Pub(reg.master, det.xPub);
       const c_master_b64 = toBase64(c_master);
 
-      // 4) Create server record with UUID rcpt_id
       const record = {
         email,
         sign_pub_det_b64: toBase64(det.edPub),
@@ -40,6 +41,20 @@ export const registerUser = createAsyncThunk(
       };
       InMemoryServer.upsertUser(record);
 
+      dispatch(
+        addLog({
+          level: "info",
+          msg: "User registered",
+          data: {
+            email,
+            rcpt_id: record.rcpt_id,
+            sign_pub_det_b64: record.sign_pub_det_b64,
+            enc_pub_rand_b64: record.enc_pub_rand_b64,
+            c_master_b64: record.c_master_b64
+          }
+        })
+      );
+
       return {
         email,
         rcpt_id: record.rcpt_id,
@@ -48,6 +63,7 @@ export const registerUser = createAsyncThunk(
         c_master_b64: record.c_master_b64
       };
     } catch (err) {
+      dispatch(addLog({ level: "error", msg: "Registration failed", data: { email, error: String(err?.message || err) } }));
       return rejectWithValue(err?.message || "Registration failed");
     }
   }
@@ -56,35 +72,49 @@ export const registerUser = createAsyncThunk(
 // ---------------- LOGIN ----------------
 export const loginUser = createAsyncThunk(
   "auth/loginUser",
-  async ({ email, password }, { rejectWithValue }) => {
+  async ({ email, password }, { dispatch, rejectWithValue }) => {
     try {
+      dispatch(addLog({ level: "info", msg: "Login started", data: { email } }));
       await readySodium();
 
       const rec = InMemoryServer.getUser(email);
       if (!rec) throw new Error("User not found");
 
-      // Re-derive deterministic keys from email+password
       const det = await deriveDeterministic(email, password);
+      dispatch(addLog({ level: "debug", msg: "Deterministic keys re-derived" }));
 
-      // Unseal master_random with deterministic keys
       const master_random = unsealMasterWithDet(rec.c_master_b64, det);
+      dispatch(addLog({ level: "debug", msg: "Sealed master opened" }));
 
-      // Derive runtime messaging keys
       const runtime = await deriveRuntimeFromMaster(master_random);
+      dispatch(
+        addLog({
+          level: "info",
+          msg: "Login success",
+          data: {
+            email,
+            rcpt_id: rec.rcpt_id,
+            runtime_pub_ed_b64: toBase64(runtime.edPub),
+            runtime_pub_x_b64: toBase64(runtime.xPub)
+          }
+        })
+      );
 
       return {
         email,
-        rcpt_id: rec.rcpt_id, // <-- UUID
+        rcpt_id: rec.rcpt_id,
         sign_pub_det_b64: rec.sign_pub_det_b64,
         enc_pub_rand_b64: rec.enc_pub_rand_b64,
         runtime_pub_ed_b64: toBase64(runtime.edPub),
         runtime_pub_x_b64: toBase64(runtime.xPub)
       };
     } catch (err) {
+      dispatch(addLog({ level: "error", msg: "Login failed", data: { email, error: String(err?.message || err) } }));
       return rejectWithValue(err?.message || "Login failed");
     }
   }
 );
+
 
 // ---------------- SLICE ----------------
 const initialState = {

@@ -55,6 +55,9 @@ export default function RegisterForm() {
                             label="Password"
                             value={password}
                             onChange={(e) => setPassword(e.target.value)}
+                            minLength={12}
+                            helperTextMin="Password too short"
+                            autoComplete="new-password"
                         />
                     </Grid>
                     <Grid size={12}>

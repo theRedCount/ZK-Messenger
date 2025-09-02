@@ -44,6 +44,8 @@ export default function LoginForm() {
                         label="Password"
                         value={password}
                         onChange={(e) => setPassword(e.target.value)}
+                        autoComplete="current-password"
+                        validateOnChange={false}   // valida solo dopo blur, se mai impostassi minLength
                     />
                 </Grid>
                 <Grid size={12}>
