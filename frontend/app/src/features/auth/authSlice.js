@@ -12,6 +12,8 @@ import {
   deriveRuntimeFromMaster
 } from "../../lib/crypto";
 import { addLog } from "../logs/logSlice";
+import { setRuntimeKeys, clearRuntimeKeys } from "../../lib/runtime";
+
 
 // ---------------- REGISTER ----------------
 export const registerUser = createAsyncThunk(
@@ -19,22 +21,13 @@ export const registerUser = createAsyncThunk(
   async ({ email, password }, { dispatch, rejectWithValue }) => {
     try {
       dispatch(addLog({ level: "info", msg: "Registration started", data: { email } }));
-
-      // Prevent duplicate registration
-      const existing = InMemoryServer.getUser(email);
-      if (existing) {
-        const message = "Email is already registered";
-        dispatch(addLog({ level: "warn", msg: "Registration blocked (duplicate email)", data: { email } }));
-        return rejectWithValue(message);
-      }
-
       await readySodium();
 
-      // 1) Deterministic keys (login)
+      // 1) Derive deterministic keys (login)
       const det = await deriveDeterministic(email, password);
       dispatch(addLog({ level: "debug", msg: "Deterministic keys derived" }));
 
-      // 2) Registration-random master & messaging keys
+      // 2) Derive random registration keys (runtime/master)
       const reg = await deriveRegistrationRandom();
       dispatch(addLog({ level: "debug", msg: "Random registration keys derived" }));
 
@@ -42,8 +35,8 @@ export const registerUser = createAsyncThunk(
       const c_master = sealToX25519Pub(reg.master, det.xPub);
       const c_master_b64 = toBase64(c_master);
 
-      // 4) Create server record with UUID rcpt_id
-      const record = {
+      // 4) Prepare record to send to server
+      const preparedRecord = {
         email,
         sign_pub_det_b64: toBase64(det.edPub),
         enc_pub_rand_b64: toBase64(reg.xPub),
@@ -51,7 +44,23 @@ export const registerUser = createAsyncThunk(
         version: "v1;a2id:t=3,m=64;hkdf:v1",
         rcpt_id: uuidv4()
       };
-      InMemoryServer.upsertUser(record);
+
+      // 5) Now check server for duplicates (server-side rule)
+      const existing = InMemoryServer.getUser(email);
+      if (existing) {
+        // We DID derive keys locally, but server rejects duplicate registration.
+        dispatch(
+          addLog({
+            level: "warn",
+            msg: "Server rejected registration (duplicate email)",
+            data: { email }
+          })
+        );
+        return rejectWithValue("Email is already registered");
+      }
+
+      // 6) Persist on server
+      InMemoryServer.upsertUser(preparedRecord);
 
       dispatch(
         addLog({
@@ -59,20 +68,20 @@ export const registerUser = createAsyncThunk(
           msg: "User registered",
           data: {
             email,
-            rcpt_id: record.rcpt_id,
-            sign_pub_det_b64: record.sign_pub_det_b64,
-            enc_pub_rand_b64: record.enc_pub_rand_b64,
-            c_master_b64: record.c_master_b64
+            rcpt_id: preparedRecord.rcpt_id,
+            sign_pub_det_b64: preparedRecord.sign_pub_det_b64,
+            enc_pub_rand_b64: preparedRecord.enc_pub_rand_b64,
+            c_master_b64: preparedRecord.c_master_b64
           }
         })
       );
 
       return {
         email,
-        rcpt_id: record.rcpt_id,
-        sign_pub_det_b64: record.sign_pub_det_b64,
-        enc_pub_rand_b64: record.enc_pub_rand_b64,
-        c_master_b64: record.c_master_b64
+        rcpt_id: preparedRecord.rcpt_id,
+        sign_pub_det_b64: preparedRecord.sign_pub_det_b64,
+        enc_pub_rand_b64: preparedRecord.enc_pub_rand_b64,
+        c_master_b64: preparedRecord.c_master_b64
       };
     } catch (err) {
       dispatch(addLog({ level: "error", msg: "Registration failed", data: { email, error: String(err?.message || err) } }));
@@ -103,6 +112,8 @@ export const loginUser = createAsyncThunk(
       dispatch(addLog({ level: "debug", msg: "Sealed master opened" }));
 
       const runtime = await deriveRuntimeFromMaster(master_random);
+      setRuntimeKeys(runtime);
+
       dispatch(
         addLog({
           level: "info",
@@ -150,6 +161,7 @@ const authSlice = createSlice({
       state.error = null;
       state.profile = null;
       state.session = null;
+      try { clearRuntimeKeys(); } catch {}
     }
   },
   extraReducers: (builder) => {
