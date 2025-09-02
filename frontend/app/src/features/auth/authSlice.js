@@ -13,24 +13,36 @@ import {
 } from "../../lib/crypto";
 import { addLog } from "../logs/logSlice";
 
-
 // ---------------- REGISTER ----------------
 export const registerUser = createAsyncThunk(
   "auth/registerUser",
   async ({ email, password }, { dispatch, rejectWithValue }) => {
     try {
       dispatch(addLog({ level: "info", msg: "Registration started", data: { email } }));
+
+      // Prevent duplicate registration
+      const existing = InMemoryServer.getUser(email);
+      if (existing) {
+        const message = "Email is already registered";
+        dispatch(addLog({ level: "warn", msg: "Registration blocked (duplicate email)", data: { email } }));
+        return rejectWithValue(message);
+      }
+
       await readySodium();
 
+      // 1) Deterministic keys (login)
       const det = await deriveDeterministic(email, password);
       dispatch(addLog({ level: "debug", msg: "Deterministic keys derived" }));
 
+      // 2) Registration-random master & messaging keys
       const reg = await deriveRegistrationRandom();
       dispatch(addLog({ level: "debug", msg: "Random registration keys derived" }));
 
+      // 3) Seal master_random to deterministic X25519 public
       const c_master = sealToX25519Pub(reg.master, det.xPub);
       const c_master_b64 = toBase64(c_master);
 
+      // 4) Create server record with UUID rcpt_id
       const record = {
         email,
         sign_pub_det_b64: toBase64(det.edPub),
@@ -78,7 +90,11 @@ export const loginUser = createAsyncThunk(
       await readySodium();
 
       const rec = InMemoryServer.getUser(email);
-      if (!rec) throw new Error("User not found");
+      if (!rec) {
+        const message = "User not found";
+        dispatch(addLog({ level: "warn", msg: "Login failed (user not found)", data: { email } }));
+        return rejectWithValue(message);
+      }
 
       const det = await deriveDeterministic(email, password);
       dispatch(addLog({ level: "debug", msg: "Deterministic keys re-derived" }));
@@ -114,7 +130,6 @@ export const loginUser = createAsyncThunk(
     }
   }
 );
-
 
 // ---------------- SLICE ----------------
 const initialState = {
