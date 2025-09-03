@@ -1,7 +1,6 @@
 // src/features/auth/authSlice.js
 import { createAsyncThunk, createSlice } from "@reduxjs/toolkit";
-import { v4 as uuidv4 } from "uuid";
-import { InMemoryServer } from "../../lib/server";
+import { addLog } from "../logs/logSlice";
 import {
   readySodium,
   deriveDeterministic,
@@ -11,9 +10,9 @@ import {
   unsealMasterWithDet,
   deriveRuntimeFromMaster
 } from "../../lib/crypto";
-import { addLog } from "../logs/logSlice";
-import { setRuntimeKeys, clearRuntimeKeys } from "../../lib/runtime";
-
+import { setRuntimeKeys, clearRuntimeKeys, setDeterministicKeys } from "../../lib/runtime";
+import { apiRegister, apiLogin } from "../../services/api";
+import { signJWS } from "../../lib/jws";
 
 // ---------------- REGISTER ----------------
 export const registerUser = createAsyncThunk(
@@ -23,65 +22,37 @@ export const registerUser = createAsyncThunk(
       dispatch(addLog({ level: "info", msg: "Registration started", data: { email } }));
       await readySodium();
 
-      // 1) Derive deterministic keys (login)
+      // 1) deterministic keys
       const det = await deriveDeterministic(email, password);
       dispatch(addLog({ level: "debug", msg: "Deterministic keys derived" }));
 
-      // 2) Derive random registration keys (runtime/master)
+      // 2) random registration keys
       const reg = await deriveRegistrationRandom();
       dispatch(addLog({ level: "debug", msg: "Random registration keys derived" }));
 
-      // 3) Seal master_random to deterministic X25519 public
-      const c_master = sealToX25519Pub(reg.master, det.xPub);
-      const c_master_b64 = toBase64(c_master);
+      // 3) seal master_random to deterministic X25519 public
+      const c_master_b64 = toBase64(sealToX25519Pub(reg.master, det.xPub));
 
-      // 4) Prepare record to send to server
-      const preparedRecord = {
+      // 4) call backend
+      const resp = await apiRegister({
         email,
         sign_pub_det_b64: toBase64(det.edPub),
         enc_pub_rand_b64: toBase64(reg.xPub),
-        c_master_b64,
-        version: "v1;a2id:t=3,m=64;hkdf:v1",
-        rcpt_id: uuidv4()
-      };
+        c_master_b64
+      });
 
-      // 5) Now check server for duplicates (server-side rule)
-      const existing = InMemoryServer.getUser(email);
-      if (existing) {
-        // We DID derive keys locally, but server rejects duplicate registration.
-        dispatch(
-          addLog({
-            level: "warn",
-            msg: "Server rejected registration (duplicate email)",
-            data: { email }
-          })
-        );
-        return rejectWithValue("Email is already registered");
-      }
-
-      // 6) Persist on server
-      InMemoryServer.upsertUser(preparedRecord);
-
-      dispatch(
-        addLog({
-          level: "info",
-          msg: "User registered",
-          data: {
-            email,
-            rcpt_id: preparedRecord.rcpt_id,
-            sign_pub_det_b64: preparedRecord.sign_pub_det_b64,
-            enc_pub_rand_b64: preparedRecord.enc_pub_rand_b64,
-            c_master_b64: preparedRecord.c_master_b64
-          }
-        })
-      );
+      dispatch(addLog({
+        level: "info",
+        msg: "User registered (backend)",
+        data: { email, rcpt_id: resp.rcpt_id }
+      }));
 
       return {
         email,
-        rcpt_id: preparedRecord.rcpt_id,
-        sign_pub_det_b64: preparedRecord.sign_pub_det_b64,
-        enc_pub_rand_b64: preparedRecord.enc_pub_rand_b64,
-        c_master_b64: preparedRecord.c_master_b64
+        rcpt_id: resp.rcpt_id,
+        sign_pub_det_b64: resp.sign_pub_det_b64,
+        enc_pub_rand_b64: resp.enc_pub_rand_b64,
+        c_master_b64
       };
     } catch (err) {
       dispatch(addLog({ level: "error", msg: "Registration failed", data: { email, error: String(err?.message || err) } }));
@@ -98,34 +69,31 @@ export const loginUser = createAsyncThunk(
       dispatch(addLog({ level: "info", msg: "Login started", data: { email } }));
       await readySodium();
 
-      const rec = InMemoryServer.getUser(email);
-      if (!rec) {
-        const message = "User not found";
-        dispatch(addLog({ level: "warn", msg: "Login failed (user not found)", data: { email } }));
-        return rejectWithValue(message);
-      }
-
+      // 1) derive deterministic
       const det = await deriveDeterministic(email, password);
+      setDeterministicKeys(det);
       dispatch(addLog({ level: "debug", msg: "Deterministic keys re-derived" }));
 
+      // 2) JWS login
+      const token = signJWS({ email, act: "login" });
+      const rec = await apiLogin({ token, email }); // UserRecord (includes c_master_b64)
+
+      // 3) open sealed master with deterministic keys
       const master_random = unsealMasterWithDet(rec.c_master_b64, det);
       dispatch(addLog({ level: "debug", msg: "Sealed master opened" }));
 
+      // 4) derive runtime keys and keep in memory
       const runtime = await deriveRuntimeFromMaster(master_random);
       setRuntimeKeys(runtime);
 
-      dispatch(
-        addLog({
-          level: "info",
-          msg: "Login success",
-          data: {
-            email,
-            rcpt_id: rec.rcpt_id,
-            runtime_pub_ed_b64: toBase64(runtime.edPub),
-            runtime_pub_x_b64: toBase64(runtime.xPub)
-          }
-        })
-      );
+      dispatch(addLog({
+        level: "info",
+        msg: "Login success",
+        data: {
+          email,
+          rcpt_id: rec.rcpt_id
+        }
+      }));
 
       return {
         email,
@@ -147,8 +115,8 @@ const initialState = {
   registering: false,
   loggingIn: false,
   error: null,
-  profile: null, // register result
-  session: null  // login result
+  profile: null,
+  session: null
 };
 
 const authSlice = createSlice({
@@ -166,32 +134,12 @@ const authSlice = createSlice({
   },
   extraReducers: (builder) => {
     builder
-      // Register
-      .addCase(registerUser.pending, (state) => {
-        state.registering = true;
-        state.error = null;
-      })
-      .addCase(registerUser.fulfilled, (state, action) => {
-        state.registering = false;
-        state.profile = action.payload;
-      })
-      .addCase(registerUser.rejected, (state, action) => {
-        state.registering = false;
-        state.error = action.payload || "Registration failed";
-      })
-      // Login
-      .addCase(loginUser.pending, (state) => {
-        state.loggingIn = true;
-        state.error = null;
-      })
-      .addCase(loginUser.fulfilled, (state, action) => {
-        state.loggingIn = false;
-        state.session = action.payload;
-      })
-      .addCase(loginUser.rejected, (state, action) => {
-        state.loggingIn = false;
-        state.error = action.payload || "Login failed";
-      });
+      .addCase(registerUser.pending, (state) => { state.registering = true; state.error = null; })
+      .addCase(registerUser.fulfilled, (state, action) => { state.registering = false; state.profile = action.payload; })
+      .addCase(registerUser.rejected, (state, action) => { state.registering = false; state.error = action.payload || "Registration failed"; })
+      .addCase(loginUser.pending, (state) => { state.loggingIn = true; state.error = null; })
+      .addCase(loginUser.fulfilled, (state, action) => { state.loggingIn = false; state.session = action.payload; })
+      .addCase(loginUser.rejected, (state, action) => { state.loggingIn = false; state.error = action.payload || "Login failed"; });
   }
 });
 

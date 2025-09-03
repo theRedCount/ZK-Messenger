@@ -1,20 +1,25 @@
 // src/features/users/usersSlice.js
 import { createAsyncThunk, createSlice } from "@reduxjs/toolkit";
-import { InMemoryServer } from "../../lib/server";
 import { addLog } from "../logs/logSlice";
+import { apiListUsers } from "../../services/api";
+import { signJWS } from "../../lib/jws";
 
 export const loadUsers = createAsyncThunk(
   "users/loadUsers",
   async (_, { dispatch, getState, rejectWithValue }) => {
     try {
       const { auth } = getState();
-      const all = InMemoryServer.listUsers();
-      // exclude self if logged in
-      const filtered = auth?.session?.email
-        ? all.filter(u => u.email !== auth.session.email)
-        : all;
+      const email = auth?.session?.email;
+      if (!email) throw new Error("Not logged in");
 
-      dispatch(addLog({ level: "info", msg: "Users loaded", data: { count: filtered.length } }));
+      // JWS for users.list
+      const token = signJWS({ email, act: "users.list" });
+      const all = await apiListUsers({ token, email });
+
+      // Exclude self
+      const filtered = all.filter((u) => u.email !== email);
+
+      dispatch(addLog({ level: "info", msg: "Users loaded (backend)", data: { count: filtered.length } }));
       return filtered;
     } catch (e) {
       dispatch(addLog({ level: "error", msg: "Users load failed", data: { error: String(e) } }));

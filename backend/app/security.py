@@ -47,9 +47,28 @@ def verify_times(iat: int, exp: int, leeway: int = 60) -> int:
         raise HTTPException(status_code=401, detail="Token expired")
     return now
 
-def verify_eddsa_with_pub_b64(pub_b64_std: str, signing_input: bytes, signature: bytes):
+
+def _b64_any_to_bytes(s: str) -> bytes:
+    s = s.strip()
+    # try standard base64 first
     try:
-        pub_bytes = base64.b64decode(pub_b64_std)  # standard base64 (libsodium style)
+        return base64.b64decode(s, validate=False)
+    except Exception:
+        pass
+    # try urlsafe base64 (add padding if missing)
+    try:
+        pad = '=' * (-len(s) % 4)
+        return base64.urlsafe_b64decode(s + pad)
+    except Exception:
+        raise HTTPException(status_code=500, detail="Server key decode error")
+
+        
+def verify_eddsa_with_pub_b64(pub_b64_std_or_url: str, signing_input: bytes, signature: bytes):
+    try:
+        pub_bytes = _b64_any_to_bytes(pub_b64_std_or_url)
+    except HTTPException:
+        # re-raise same error
+        raise
     except Exception:
         raise HTTPException(status_code=500, detail="Server key decode error")
     try:
