@@ -57,6 +57,9 @@ export const sendMessage = createAsyncThunk(
   async ({ toRcptId, text }, { getState, dispatch, rejectWithValue }) => {
     try {
       await sodium.ready;
+      if (sodium.base64_variants.URLSAFE_NO_PADDING !== B64V()) {
+        throw new Error("B64 variant mismatch");
+      }
       const { auth } = getState();
       if (!auth.session) throw new Error("Not logged in");
 
@@ -82,28 +85,16 @@ export const sendMessage = createAsyncThunk(
         myPubXB64,
         msg_id
       );
+      if (a_pk.length !== 32) throw new Error("ephemeral pubkey len invalid");
 
       // shared & AEAD key
       const rcptPub = fromB64(rec.enc_pub_rand_b64);
       const s = sodium.crypto_scalarmult(a_sk, rcptPub); // 32B
       const mk = await deriveMessageKey(s, msg_id);
+      if (mk.length !== 32) throw new Error("mk derivation failed");
 
       // Generate sodium keypair for signing
       const signKeyPair = sodium.crypto_sign_seed_keypair(runtime.edPriv); // {publicKey:32, privateKey:64}
-      
-      // Debug: check if keys match
-      const nobleKeyB64 = b64(runtime.edPub);
-      const sodiumKeyB64 = b64(signKeyPair.publicKey);
-      
-      dispatch(addLog({
-        level: "debug",
-        msg: "Key comparison during send",
-        data: {
-          noble_key: truncate(nobleKeyB64, 40),
-          sodium_key: truncate(sodiumKeyB64, 40),
-          keys_match: nobleKeyB64 === sodiumKeyB64
-        }
-      }));
 
       // body - use sodium's public key for consistency with signing
       const ts = new Date().toISOString();
@@ -183,9 +174,12 @@ export const sendMessage = createAsyncThunk(
 // ---------------- FETCH CONVERSATION (verify with sodium + embedded ctx) ----------------
 export const fetchConversation = createAsyncThunk(
   "chat/fetchConversation",
-  async ({ peerRcptId }, { getState, dispatch, rejectWithValue }) => {
+  async ({ peerRcptId, offset=0, limit=200 }, { getState, dispatch, rejectWithValue }) => {
     try {
       await sodium.ready;
+      if (sodium.base64_variants.URLSAFE_NO_PADDING !== B64V()) {
+        throw new Error("B64 variant mismatch");
+      }
       const { auth } = getState();
       if (!auth.session) throw new Error("Not logged in");
 
@@ -205,10 +199,15 @@ export const fetchConversation = createAsyncThunk(
         myXPriv,
         peer.enc_pub_rand_b64
       );
-      const envs = InMemoryServer.fetchConversation(conv_token_b64);
+      
+      const envs = InMemoryServer.fetchConversation(conv_token_b64, { offset, limit });
 
       const out = [];
       for (const env of envs) {
+        if (!env?.nonce_b64 || !env?.ct_b64 || !env?.eph_pub_b64 || !env?.msg_id) {
+          dispatch(addLog({ level:"warn", msg:"Skipping malformed envelope", data:{ env } }));
+          continue;
+        }
         const fallbackTs = env?.ts_client || new Date().toISOString();
         
         dispatch(addLog({
@@ -240,6 +239,7 @@ export const fetchConversation = createAsyncThunk(
             
             const s_in = sodium.crypto_scalarmult(myXPriv, eph_pub);
             const mk_in = await deriveMessageKey(s_in, msg_id);
+            if (mk_in.length !== 32) throw new Error("mk_in derivation failed");
             payloadU8 = sodium.crypto_secretbox_open_easy(ct, nonce, mk_in);
             
             if (payloadU8) {
@@ -338,6 +338,7 @@ export const fetchConversation = createAsyncThunk(
             const peerPub = fromB64(peer.enc_pub_rand_b64);
             const s_out = sodium.crypto_scalarmult(my_det_sk, peerPub);
             const mk_out = await deriveMessageKey(s_out, msg_id);
+            if (mk_out.length !== 32) throw new Error("mk_out derivation failed");
             const payloadU8b = sodium.crypto_secretbox_open_easy(ct, nonce, mk_out);
             if (!payloadU8b) {
               dispatch(addLog({

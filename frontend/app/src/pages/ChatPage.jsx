@@ -99,10 +99,13 @@ export default function ChatPage() {
   const onSend = async () => {
     const text = input.trim();
     if (!text || !peer) return;
+    const buf = new Uint8Array(16); 
+    crypto.getRandomValues(buf);
+    const optimisticId = Array.from(buf).map(b=>b.toString(16).padStart(2,"0")).join("");
     const body = {
       v: 1,
       ts_client: new Date().toISOString(),
-      msg_id: Math.random().toString(16).slice(2),
+      msg_id: optimisticId,
       message: text
     };
     // optimistic append
