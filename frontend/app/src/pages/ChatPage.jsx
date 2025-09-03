@@ -20,7 +20,7 @@ import ArrowBackIcon from "@mui/icons-material/ArrowBack";
 import SendIcon from "@mui/icons-material/Send";
 import RefreshIcon from "@mui/icons-material/Refresh";
 import { InMemoryServer } from "../lib/server";
-import { appendOutgoing, fetchInbox, sendMessage } from "../features/chat/chatSlice";
+import { appendOutgoing, sendMessage, fetchConversation } from "../features/chat/chatSlice";
 
 const LS_HEIGHT_KEY = "logConsole.height";
 const LS_OPEN_KEY = "logConsole.open";
@@ -80,26 +80,21 @@ export default function ChatPage() {
     setLoadingPeer(false);
   }, [rcptId]);
 
-  // autoscroll on new messages
+  // fetch full conversation (DEDK) when peer/session ready
+  useEffect(() => {
+    if (session && peer) {
+      dispatch(fetchConversation({ peerRcptId: rcptId }));
+    }
+  }, [dispatch, session, peer, rcptId]);
+
+  // autoscroll on new messages or panel resize
   useEffect(() => {
     const el = listRef.current;
     if (!el) return;
     el.scrollTop = el.scrollHeight;
   }, [threads, rcptId, reservedBottom]);
 
-  const myThreadKeyIncoming = useMemo(() => {
-    // incoming messages are grouped by sender email in the slice
-    return peer?.email || "inbox";
-  }, [peer]);
-
-  const items = useMemo(() => {
-    const incoming = threads[myThreadKeyIncoming] || [];
-    const outgoing = threads[rcptId] || [];
-    const merged = [...incoming, ...outgoing].sort((a, b) =>
-      String(a.ts).localeCompare(String(b.ts))
-    );
-    return merged;
-  }, [threads, myThreadKeyIncoming, rcptId]);
+  const items = useMemo(() => threads[rcptId] || [], [threads, rcptId]);
 
   const onSend = async () => {
     const text = input.trim();
@@ -115,10 +110,12 @@ export default function ChatPage() {
     setInput("");
     // real send
     await dispatch(sendMessage({ toRcptId: rcptId, text }));
+    // ensure we fetch updated conversation (optional, depending on server design)
+    // await dispatch(fetchConversation({ peerRcptId: rcptId }));
   };
 
   const onFetch = async () => {
-    await dispatch(fetchInbox());
+    await dispatch(fetchConversation({ peerRcptId: rcptId }));
   };
 
   if (loadingPeer) {
@@ -152,7 +149,7 @@ export default function ChatPage() {
             <Typography variant="subtitle1">{peer.email}</Typography>
             <Typography variant="caption" color="text.secondary">rcpt_id: {peer.rcpt_id}</Typography>
           </Box>
-          <Tooltip title="Fetch inbox">
+          <Tooltip title="Fetch conversation">
             <IconButton onClick={onFetch} color="inherit">
               <RefreshIcon />
             </IconButton>
@@ -167,12 +164,18 @@ export default function ChatPage() {
           overflow: "auto",
           p: 2,
           bgcolor: "background.default",
-          // make sure content is not hidden behind sticky composer
           paddingBottom: 2
         }}
       >
         {items.map((m) => (
-          <Box key={m.msg_id + m.ts} sx={{ display: "flex", mb: 1.2, justifyContent: m.direction === "out" ? "flex-end" : "flex-start" }}>
+          <Box
+            key={m.msg_id + m.ts}
+            sx={{
+              display: "flex",
+              mb: 1.2,
+              justifyContent: m.direction === "out" ? "flex-end" : "flex-start"
+            }}
+          >
             <Paper
               sx={{
                 maxWidth: "70%",
@@ -183,7 +186,10 @@ export default function ChatPage() {
                 boxShadow: "none"
               }}
             >
-              <Typography variant="body2" sx={{ whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
+              <Typography
+                variant="body2"
+                sx={{ whiteSpace: "pre-wrap", wordBreak: "break-word" }}
+              >
                 {m.text}
               </Typography>
               <Box sx={{ textAlign: "right", mt: 0.5 }}>
@@ -205,7 +211,7 @@ export default function ChatPage() {
           position: "sticky",
           bottom: reservedBottom, // lift above log console height
           bgcolor: "background.default",
-          zIndex: (t) => t.zIndex.appBar // ensure over content
+          zIndex: (t) => t.zIndex.appBar
         }}
       >
         <TextField
@@ -222,17 +228,15 @@ export default function ChatPage() {
               onSend();
             }
           }}
-          InputProps={
-            {
-              endAdornment: (
-                <InputAdornment position="end">
-                  <IconButton onClick={onSend} disabled={!input.trim()} aria-label="Send">
-                    <SendIcon />
-                  </IconButton>
-                </InputAdornment>
-              )
-            }
-          }
+          InputProps={{
+            endAdornment: (
+              <InputAdornment position="end">
+                <IconButton onClick={onSend} disabled={!input.trim()} aria-label="Send">
+                  <SendIcon />
+                </IconButton>
+              </InputAdornment>
+            )
+          }}
         />
       </Box>
     </Box>

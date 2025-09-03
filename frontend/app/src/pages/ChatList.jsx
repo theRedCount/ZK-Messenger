@@ -68,7 +68,7 @@ export default function ChatList() {
             <AppBar position="static" color="transparent" elevation={0} sx={{ borderBottom: "1px solid rgba(255,255,255,0.08)" }}>
                 <Toolbar>
                     <Typography variant="h6" sx={{ flex: 1, fontWeight: 700 }}>
-                        Uncontrollable
+                        ZK Messenger
                     </Typography>
                     <Tooltip title={`Logged as ${session?.email || ""}`}>
                         <Typography variant="body2" color="text.secondary" sx={{ mr: 1 }}>

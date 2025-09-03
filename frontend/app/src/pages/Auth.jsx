@@ -26,7 +26,7 @@ export default function Auth() {
       >
         <Box sx={{ p: 3, textAlign: "center", bgcolor: "background.paper" }}>
           <Typography variant="h5" fontWeight="bold" color="primary">
-            Uncontrollable
+            ZK Messenger
           </Typography>
           <Typography variant="body2" color="text.secondary">
             Zero Knowledge Messaging
