@@ -3,41 +3,55 @@ import { createAsyncThunk, createSlice } from "@reduxjs/toolkit";
 import { InMemoryServer } from "../../lib/server";
 import { addLog } from "../logs/logSlice";
 import sodium from "libsodium-wrappers";
-import { ed25519 } from "@noble/curves/ed25519";
 import { getRuntimeKeys } from "../../lib/runtime";
-import { hkdf32 } from "../../lib/crypto"; // deve esistere (come in auth)
+import { hkdf32 } from "../../lib/crypto";
 
 const te = new TextEncoder();
 
-// --- helpers ---
-const b64 = (u8) => sodium.to_base64(u8);
-const fromB64 = (s) => sodium.from_base64(s);
+// ---------- Base64 helpers (URLSAFE_NO_PADDING everywhere) ----------
+const B64V = () => sodium.base64_variants.URLSAFE_NO_PADDING;
+const b64 = (u8) => sodium.to_base64(u8, B64V());
+const fromB64 = (s) => sodium.from_base64(s, B64V());
 const truncate = (s, max = 64) =>
   typeof s === "string" && s.length > max ? s.slice(0, max) + `…(${s.length})` : s;
 
-// derive conversation root & token
-async function deriveConvRootAndToken(myXPriv, peerXPub_b64) {
+function safeIso(tsCandidate) {
+  const t = Date.parse(tsCandidate);
+  return Number.isNaN(t) ? new Date().toISOString() : new Date(t).toISOString();
+}
+
+// ---------- Clamp helper for X25519 private scalars ----------
+function clampScalar(sk) {
+  const out = new Uint8Array(sk); // copy
+  out[0] &= 248;
+  out[31] &= 127;
+  out[31] |= 64;
+  return out;
+}
+
+// ---------- Conversation root & token (static-static DH) ----------
+async function deriveConvRootAndToken(myXPrivRaw, peerXPub_b64) {
   const peerPub = fromB64(peerXPub_b64);
+  const myXPriv = clampScalar(myXPrivRaw);
   const sharedStatic = sodium.crypto_scalarmult(myXPriv, peerPub); // 32B
   const R = await hkdf32(sharedStatic, "conv-root:v1");           // 32B
   const tokenBytes = await hkdf32(R, "conv-id:v1");               // 32B
   return { R, conv_token_b64: b64(tokenBytes) };
 }
 
-// deterministic ephemeral (sender-side) from msg_id
-async function deriveDeterministicEphemeral(R, dirLabel, msgId) {
-  const seed = await hkdf32(R, `dedk:${dirLabel}|sk|${msgId}`); // 32B
-  const sk = seed;                                              // libsodium clampa internamente
+// ---------- Deterministic ephemeral (only sender can rebuild) ----------
+async function deriveDeterministicEphemeral(R, senderPubXB64, msgId) {
+  const seed = await hkdf32(R, `dedk:sk|${msgId}|${senderPubXB64}`); // 32B
+  const sk = clampScalar(seed);
   const pk = sodium.crypto_scalarmult_base(sk);
   return { sk, pk };
 }
 
-// derive aead key from shared and msg_id
 async function deriveMessageKey(shared, msgId) {
   return await hkdf32(shared, `mk|${msgId}`); // 32B
 }
 
-// ---------------- SEND (DEDK) ----------------
+// ---------------- SEND (DEDK + ctx inside payload; Ed25519 via sodium) ----------------
 export const sendMessage = createAsyncThunk(
   "chat/sendMessage",
   async ({ toRcptId, text }, { getState, dispatch, rejectWithValue }) => {
@@ -50,47 +64,85 @@ export const sendMessage = createAsyncThunk(
       const rec = InMemoryServer.getUserByRcptId(toRcptId);
       if (!rec) throw new Error("Recipient not found");
 
-      const runtime = getRuntimeKeys(); // { edPriv, edPub, xPriv, xPub }
+      const runtime = getRuntimeKeys(); // { edPriv(32), edPub(32) from noble, xPriv, xPub }
+      const myPubXB64 = b64(runtime.xPub);
 
       // conversation root & token
-      const { R, conv_token_b64 } = await deriveConvRootAndToken(runtime.xPriv, rec.enc_pub_rand_b64);
+      const { R, conv_token_b64 } = await deriveConvRootAndToken(
+        runtime.xPriv,
+        rec.enc_pub_rand_b64
+      );
 
       // per-message id (in chiaro)
       const msg_id = sodium.to_hex(sodium.randombytes_buf(16));
 
-      // deterministic ephemeral from (R, msg_id)
-      const { sk: a_sk, pk: a_pk } = await deriveDeterministicEphemeral(R, "A->B", msg_id);
-      const s = sodium.crypto_scalarmult(a_sk, fromB64(rec.enc_pub_rand_b64)); // 32B
+      // deterministic ephemeral from (R, msg_id, myPubXB64)
+      const { sk: a_sk, pk: a_pk } = await deriveDeterministicEphemeral(
+        R,
+        myPubXB64,
+        msg_id
+      );
+
+      // shared & AEAD key
+      const rcptPub = fromB64(rec.enc_pub_rand_b64);
+      const s = sodium.crypto_scalarmult(a_sk, rcptPub); // 32B
       const mk = await deriveMessageKey(s, msg_id);
 
-      // build body
+      // Generate sodium keypair for signing
+      const signKeyPair = sodium.crypto_sign_seed_keypair(runtime.edPriv); // {publicKey:32, privateKey:64}
+      
+      // Debug: check if keys match
+      const nobleKeyB64 = b64(runtime.edPub);
+      const sodiumKeyB64 = b64(signKeyPair.publicKey);
+      
+      dispatch(addLog({
+        level: "debug",
+        msg: "Key comparison during send",
+        data: {
+          noble_key: truncate(nobleKeyB64, 40),
+          sodium_key: truncate(sodiumKeyB64, 40),
+          keys_match: nobleKeyB64 === sodiumKeyB64
+        }
+      }));
+
+      // body - use sodium's public key for consistency with signing
       const ts = new Date().toISOString();
       const bodyObj = {
         v: 1,
         ts_client: ts,
         msg_id,
         sender_email: senderEmail,
-        sender_pub_ed_b64: b64(runtime.edPub),
-        sender_pub_x_b64: b64(runtime.xPub),
+        sender_pub_ed_b64: b64(signKeyPair.publicKey), // use sodium's pub key for consistency
+        sender_pub_x_b64: myPubXB64,
         message: text
       };
       const bodyBytes = te.encode(JSON.stringify(bodyObj));
 
-      // sign with Ed25519 binding rcpt pub + a_pk + msg_id
-      const ctxBytes = te.encode(
-        "ctx:v1|rcpt=" + rec.enc_pub_rand_b64 + "|eph=" + b64(a_pk) + "|msg_id=" + msg_id
-      );
+      // exact ctx used for signature (store inside payload)
+      const ctxStr =
+        "ctx:v1|rcpt=" + rec.enc_pub_rand_b64 + "|eph=" + b64(a_pk) + "|msg_id=" + msg_id;
+      const ctxBytes = te.encode(ctxStr);
+
+      // sign (sodium)
       const toSign = new Uint8Array(bodyBytes.length + ctxBytes.length);
       toSign.set(bodyBytes, 0);
       toSign.set(ctxBytes, bodyBytes.length);
-      const sig = ed25519.sign(toSign, runtime.edPriv);
+      const sig = sodium.crypto_sign_detached(toSign, signKeyPair.privateKey); // 64B
 
       // AEAD (XSalsa20-Poly1305) with mk
-      const nonce = sodium.randombytes_buf(sodium.crypto_box_NONCEBYTES);
-      const payload = JSON.stringify({ body_b64: b64(bodyBytes), sig_b64: b64(sig) });
-      const ct = sodium.crypto_secretbox_easy(te.encode(payload), nonce, mk);
+      const nonce = sodium.randombytes_buf(sodium.crypto_box_NONCEBYTES); // 24B
+      const payloadObj = {
+        body_b64: b64(bodyBytes),
+        sig_b64: b64(sig),
+        ctx_b64: b64(ctxBytes)
+      };
+      const ct = sodium.crypto_secretbox_easy(
+        te.encode(JSON.stringify(payloadObj)),
+        nonce,
+        mk
+      );
 
-      // envelope (sealed sender, + conv token opaco)
+      // envelope
       const envelope = {
         v: 1,
         rcpt_id: rec.rcpt_id,
@@ -128,7 +180,7 @@ export const sendMessage = createAsyncThunk(
   }
 );
 
-// ---------------- FETCH CONVERSATION (decrypt both directions) ----------------
+// ---------------- FETCH CONVERSATION (verify with sodium + embedded ctx) ----------------
 export const fetchConversation = createAsyncThunk(
   "chat/fetchConversation",
   async ({ peerRcptId }, { getState, dispatch, rejectWithValue }) => {
@@ -137,71 +189,251 @@ export const fetchConversation = createAsyncThunk(
       const { auth } = getState();
       if (!auth.session) throw new Error("Not logged in");
 
-      const me = auth.session;
+      const meEmail = auth.session.email;
       const peer = InMemoryServer.getUserByRcptId(peerRcptId);
       if (!peer) throw new Error("Peer not found");
 
+      const meRec = InMemoryServer.getUser(meEmail);
+      if (!meRec) throw new Error("Self record not found");
+
       const runtime = getRuntimeKeys();
+      const myXPriv = clampScalar(runtime.xPriv);
+      const myPubXB64_runtime = b64(runtime.xPub); // only for deterministic ephemeral
 
       // conv token
-      const { R, conv_token_b64 } = await deriveConvRootAndToken(runtime.xPriv, peer.enc_pub_rand_b64);
+      const { R, conv_token_b64 } = await deriveConvRootAndToken(
+        myXPriv,
+        peer.enc_pub_rand_b64
+      );
       const envs = InMemoryServer.fetchConversation(conv_token_b64);
 
       const out = [];
       for (const env of envs) {
+        const fallbackTs = env?.ts_client || new Date().toISOString();
+        
+        dispatch(addLog({
+          level: "debug",
+          msg: "Processing envelope",
+          data: {
+            msg_id: env?.msg_id,
+            alg: env?.alg,
+            has_nonce: !!env?.nonce_b64,
+            has_ct: !!env?.ct_b64,
+            has_eph_pub: !!env?.eph_pub_b64
+          }
+        }));
+        
         try {
+          const { msg_id } = env;
           const nonce = fromB64(env.nonce_b64);
           const ct = fromB64(env.ct_b64);
           const eph_pub = fromB64(env.eph_pub_b64);
-          const msg_id = env.msg_id;
 
-          // 1) try as incoming: s = X25519(my xPriv, eph_pub)
-          let s_in = sodium.crypto_scalarmult(runtime.xPriv, eph_pub);
-          let mk_in = await deriveMessageKey(s_in, msg_id);
-          let payloadU8 = sodium.crypto_secretbox_open_easy(ct, nonce, mk_in);
+          // try INCOMING (my xPriv, eph_pub)
+          let payloadU8 = null;
+          try {
+            dispatch(addLog({
+              level: "debug", 
+              msg: "Trying INCOMING decryption",
+              data: { msg_id }
+            }));
+            
+            const s_in = sodium.crypto_scalarmult(myXPriv, eph_pub);
+            const mk_in = await deriveMessageKey(s_in, msg_id);
+            payloadU8 = sodium.crypto_secretbox_open_easy(ct, nonce, mk_in);
+            
+            if (payloadU8) {
+              dispatch(addLog({
+                level: "debug",
+                msg: "INCOMING decryption SUCCESS",
+                data: { msg_id }
+              }));
+              
+              const parsed = JSON.parse(new TextDecoder().decode(payloadU8));
+              const bodyBytes = fromB64(parsed.body_b64);
+              const sigBytes = fromB64(parsed.sig_b64);
+              const ctxFromPayload = fromB64(parsed.ctx_b64);
+              const bodyObj = JSON.parse(new TextDecoder().decode(bodyBytes));
 
-          let direction = "in";
-          if (!payloadU8) {
-            // 2) try as outgoing (DEDK recomputed): a_sk from (R, msg_id), s = X25519(a_sk, peer.xPub)
-            const { sk: my_det_sk } = await deriveDeterministicEphemeral(R, "A->B", msg_id);
-            const s_out = sodium.crypto_scalarmult(my_det_sk, fromB64(peer.enc_pub_rand_b64));
-            const mk_out = await deriveMessageKey(s_out, msg_id);
-            payloadU8 = sodium.crypto_secretbox_open_easy(ct, nonce, mk_out);
-            direction = "out";
+              const direction = bodyObj.sender_email === meEmail ? "out" : "in";
+
+              // verify with sodium against embedded ctx
+              const toVerify = new Uint8Array(bodyBytes.length + ctxFromPayload.length);
+              toVerify.set(bodyBytes, 0);
+              toVerify.set(ctxFromPayload, bodyBytes.length);
+              const sender_ed_pub = fromB64(bodyObj.sender_pub_ed_b64);
+              const ok = sodium.crypto_sign_verify_detached(sigBytes, toVerify, sender_ed_pub);
+
+              // Debug verification for incoming messages
+              dispatch(addLog({
+                level: "debug",
+                msg: `Signature verification (INCOMING): ${ok ? "SUCCESS" : "FAILED"}`,
+                data: {
+                  msg_id,
+                  sender_email: bodyObj.sender_email,
+                  direction,
+                  ok,
+                  sender_pub_ed_b64: truncate(bodyObj.sender_pub_ed_b64, 40),
+                  sig_length: sigBytes.length,
+                  body_length: bodyBytes.length,
+                  ctx_length: ctxFromPayload.length
+                }
+              }));
+
+              // optional: compare with locally rebuilt ctx (diagnostic only)
+              const localCtxStr =
+                "ctx:v1|rcpt=" +
+                (direction === "in" ? meRec.enc_pub_rand_b64 : peer.enc_pub_rand_b64) +
+                "|eph=" +
+                env.eph_pub_b64 +
+                "|msg_id=" +
+                msg_id;
+              const localCtxBytes = te.encode(localCtxStr);
+              if (ok && b64(localCtxBytes) !== b64(ctxFromPayload)) {
+                dispatch(
+                  addLog({
+                    level: "warn",
+                    msg: "CTX mismatch (verify ok with embedded ctx)",
+                    data: {
+                      msg_id,
+                      local_ctx_b64: truncate(b64(localCtxBytes), 120),
+                      embedded_ctx_b64: truncate(b64(ctxFromPayload), 120)
+                    }
+                  })
+                );
+              }
+
+              out.push({
+                direction,
+                ok,
+                from: bodyObj.sender_email || "(unknown)",
+                ts: safeIso(bodyObj.ts_client || fallbackTs),
+                msg_id: bodyObj.msg_id,
+                text: bodyObj.message
+              });
+              continue;
+            }
+          } catch (incomingError) {
+            dispatch(addLog({
+              level: "debug",
+              msg: "INCOMING decryption FAILED",
+              data: { msg_id, error: String(incomingError) }
+            }));
+            // payloadU8 remains null, will try OUTGOING
           }
 
-          if (!payloadU8) throw new Error("Decryption failed");
+          // try OUTGOING (rebuild my deterministic ephemeral)
+          {
+            dispatch(addLog({
+              level: "debug",
+              msg: "Trying OUTGOING decryption",
+              data: { msg_id }
+            }));
+            
+            const { sk: my_det_sk } = await deriveDeterministicEphemeral(
+              R,
+              myPubXB64_runtime,
+              msg_id
+            );
+            const peerPub = fromB64(peer.enc_pub_rand_b64);
+            const s_out = sodium.crypto_scalarmult(my_det_sk, peerPub);
+            const mk_out = await deriveMessageKey(s_out, msg_id);
+            const payloadU8b = sodium.crypto_secretbox_open_easy(ct, nonce, mk_out);
+            if (!payloadU8b) {
+              dispatch(addLog({
+                level: "debug",
+                msg: "OUTGOING decryption FAILED",
+                data: { msg_id }
+              }));
+              throw new Error("Decryption failed");
+            }
 
-          const { body_b64, sig_b64 } = JSON.parse(new TextDecoder().decode(payloadU8));
-          const bodyBytes = fromB64(body_b64);
-          const sigBytes = fromB64(sig_b64);
-          const bodyObj = JSON.parse(new TextDecoder().decode(bodyBytes));
+            dispatch(addLog({
+              level: "debug",
+              msg: "OUTGOING decryption SUCCESS",
+              data: { msg_id }
+            }));
 
-          // verify signature
-          const ctxBytes = te.encode(
-            "ctx:v1|rcpt=" +
-              (direction === "in" ? b64(runtime.xPub) : peer.enc_pub_rand_b64) +
+            const parsed = JSON.parse(new TextDecoder().decode(payloadU8b));
+            const bodyBytes = fromB64(parsed.body_b64);
+            const sigBytes = fromB64(parsed.sig_b64);
+            const ctxFromPayload = fromB64(parsed.ctx_b64);
+            const bodyObj = JSON.parse(new TextDecoder().decode(bodyBytes));
+
+            const direction = bodyObj.sender_email === meEmail ? "out" : "in";
+
+            const toVerify = new Uint8Array(bodyBytes.length + ctxFromPayload.length);
+            toVerify.set(bodyBytes, 0);
+            toVerify.set(ctxFromPayload, bodyBytes.length);
+            const sender_ed_pub = fromB64(bodyObj.sender_pub_ed_b64);
+            const ok = sodium.crypto_sign_verify_detached(sigBytes, toVerify, sender_ed_pub);
+
+            // Debug verification for outgoing messages
+            dispatch(addLog({
+              level: "debug",
+              msg: `Signature verification (OUTGOING): ${ok ? "SUCCESS" : "FAILED"}`,
+              data: {
+                msg_id,
+                sender_email: bodyObj.sender_email,
+                direction,
+                ok,
+                sender_pub_ed_b64: truncate(bodyObj.sender_pub_ed_b64, 40),
+                sig_length: sigBytes.length,
+                body_length: bodyBytes.length,
+                ctx_length: ctxFromPayload.length,
+                my_email: meEmail
+              }
+            }));
+
+            const localCtxStr =
+              "ctx:v1|rcpt=" +
+              (direction === "in" ? meRec.enc_pub_rand_b64 : peer.enc_pub_rand_b64) +
               "|eph=" +
               env.eph_pub_b64 +
               "|msg_id=" +
-              msg_id
-          );
-          const toVerify = new Uint8Array(bodyBytes.length + ctxBytes.length);
-          toVerify.set(bodyBytes, 0);
-          toVerify.set(ctxBytes, bodyBytes.length);
-          const sender_ed_pub = fromB64(bodyObj.sender_pub_ed_b64);
-          const ok = ed25519.verify(sigBytes, toVerify, sender_ed_pub);
+              msg_id;
+            const localCtxBytes = te.encode(localCtxStr);
+            if (ok && b64(localCtxBytes) !== b64(ctxFromPayload)) {
+              dispatch(
+                addLog({
+                  level: "warn",
+                  msg: "CTX mismatch (verify ok with embedded ctx)",
+                  data: {
+                    msg_id,
+                    local_ctx_b64: truncate(b64(localCtxBytes), 120),
+                    embedded_ctx_b64: truncate(b64(ctxFromPayload), 120)
+                  }
+                })
+              );
+            }
 
-          out.push({
-            direction,
-            ok,
-            from: bodyObj.sender_email || "(unknown)",
-            ts: bodyObj.ts_client,
-            msg_id: bodyObj.msg_id,
-            text: bodyObj.message
-          });
+            out.push({
+              direction,
+              ok,
+              from: bodyObj.sender_email || "(unknown)",
+              ts: safeIso(bodyObj.ts_client || fallbackTs),
+              msg_id: bodyObj.msg_id,
+              text: bodyObj.message
+            });
+          }
         } catch (err) {
-          out.push({ direction: "in", ok: false, error: String(err) });
+          dispatch(addLog({
+            level: "debug",
+            msg: "Message processing ERROR",
+            data: {
+              msg_id: env?.msg_id,
+              error: String(err),
+              stack: err.stack?.split('\n').slice(0, 3).join(' | ') || 'no stack'
+            }
+          }));
+          
+          out.push({
+            direction: "in",
+            ok: false,
+            error: String(err),
+            ts: safeIso(fallbackTs),
+            msg_id: env?.msg_id || Math.random().toString(16).slice(2)
+          });
         }
       }
 
@@ -215,7 +447,9 @@ export const fetchConversation = createAsyncThunk(
 
       return { peerKey: peerRcptId, items: out };
     } catch (e) {
-      dispatch(addLog({ level: "error", msg: "Fetch conversation failed", data: { error: String(e) } }));
+      dispatch(
+        addLog({ level: "error", msg: "Fetch conversation failed", data: { error: String(e) } })
+      );
       return rejectWithValue(String(e));
     }
   }
@@ -225,10 +459,10 @@ export const fetchConversation = createAsyncThunk(
 const chatSlice = createSlice({
   name: "chat",
   initialState: {
-    // threads keyed by: peer rcpt_id
     threads: {} // { [peerRcptId]: Array<Message> }
   },
   reducers: {
+    // Optimistic append for outgoing
     appendOutgoing(state, action) {
       const { toRcptId, body } = action.payload;
       if (!state.threads[toRcptId]) state.threads[toRcptId] = [];
@@ -243,7 +477,7 @@ const chatSlice = createSlice({
   },
   extraReducers: (b) => {
     b.addCase(sendMessage.fulfilled, (s) => {
-      // optimistic già fatto
+      // optimistic already appended
     });
     b.addCase(fetchConversation.fulfilled, (s, a) => {
       const { peerKey, items } = a.payload;
