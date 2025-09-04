@@ -13,7 +13,6 @@ const truncate = (s, max = 64) =>
   typeof s === "string" && s.length > max ? s.slice(0, max) + `…(${s.length})` : s;
 const b64 = (u8) => sodium.to_base64(u8);
 
-// Resolve recipient record by rcpt_id from backend users list
 async function getRecipientByRcptId({ token, email, rcptId }) {
   const users = await apiListUsers({ token, email });
   return users.find(u => u.rcpt_id === rcptId) || null;
@@ -27,15 +26,13 @@ export const sendMessage = createAsyncThunk(
       await sodium.ready;
       const { auth } = getState();
       if (!auth.session) throw new Error("Not logged in");
-
       const senderEmail = auth.session.email;
 
-      // need recipient enc_pub_rand_b64 to encrypt
       const tokenList = signJWS({ email: senderEmail, act: "users.list" });
       const rec = await getRecipientByRcptId({ token: tokenList, email: senderEmail, rcptId: toRcptId });
       if (!rec) throw new Error("Recipient not found");
 
-      const runtime = getRuntimeKeys(); // { edPriv, edPub, xPriv, xPub }
+      const runtime = getRuntimeKeys();
 
       if (VERBOSE_LOGS) {
         dispatch(addLog({
@@ -51,14 +48,10 @@ export const sendMessage = createAsyncThunk(
         }));
       }
 
-      // 1) ephemeral
       const eph = sodium.crypto_box_keypair();
-
-      // 2) shared
       const rcpt_pub = sodium.from_base64(rec.enc_pub_rand_b64);
       const shared = sodium.crypto_box_beforenm(rcpt_pub, eph.privateKey);
 
-      // 3) body
       const ts = new Date().toISOString();
       const msg_id = sodium.to_hex(sodium.randombytes_buf(16));
       const bodyObj = {
@@ -72,13 +65,11 @@ export const sendMessage = createAsyncThunk(
       };
       const bodyBytes = te.encode(JSON.stringify(bodyObj));
 
-      // 4) sign with context
       const ctxBytes = te.encode("ctx:v1|rcpt=" + rec.enc_pub_rand_b64 + "|eph=" + b64(eph.publicKey));
       const toSign = new Uint8Array(bodyBytes.length + ctxBytes.length);
       toSign.set(bodyBytes, 0); toSign.set(ctxBytes, bodyBytes.length);
       const sig = ed25519.sign(toSign, runtime.edPriv);
 
-      // 5) encrypt
       const nonce = sodium.randombytes_buf(sodium.crypto_box_NONCEBYTES);
       const payload = JSON.stringify({ body_b64: b64(bodyBytes), sig_b64: b64(sig) });
       const ct = sodium.crypto_box_easy_afternm(te.encode(payload), nonce, shared);
@@ -92,7 +83,6 @@ export const sendMessage = createAsyncThunk(
         ct_b64: b64(ct)
       };
 
-      // backend POST /messages (Authorization header only; body is the envelope)
       const tokenSend = signJWS({ email: senderEmail, act: "send" });
       await apiPostMessage({ token: tokenSend, email: senderEmail, envelope });
 
@@ -116,7 +106,7 @@ export const sendMessage = createAsyncThunk(
   }
 );
 
-// --- Fetch & decrypt inbox ---
+// --- Fetch & decrypt inbox (manual) ---
 export const fetchInbox = createAsyncThunk(
   "chat/fetchInbox",
   async (_, { getState, dispatch, rejectWithValue }) => {
@@ -137,22 +127,17 @@ export const fetchInbox = createAsyncThunk(
         try {
           const eph_pub = sodium.from_base64(env.eph_pub_b64);
           const shared = sodium.crypto_box_beforenm(eph_pub, runtime.xPriv);
-
           const nonce = sodium.from_base64(env.nonce_b64);
           const ct = sodium.from_base64(env.ct_b64);
           const payload = sodium.crypto_box_open_easy_afternm(ct, nonce, shared);
           if (!payload) throw new Error("Decryption failed");
-
           const { body_b64, sig_b64 } = JSON.parse(new TextDecoder().decode(payload));
-
           const bodyBytes = sodium.from_base64(body_b64);
           const sigBytes = sodium.from_base64(sig_b64);
           const bodyObj = JSON.parse(new TextDecoder().decode(bodyBytes));
-
           const ctxBytes = new TextEncoder().encode("ctx:v1|rcpt=" + b64(runtime.xPub) + "|eph=" + env.eph_pub_b64);
           const toVerify = new Uint8Array(bodyBytes.length + ctxBytes.length);
-          toVerify.set(bodyBytes, 0);
-          toVerify.set(ctxBytes, bodyBytes.length);
+          toVerify.set(bodyBytes, 0); toVerify.set(ctxBytes, bodyBytes.length);
           const sender_ed_pub = sodium.from_base64(bodyObj.sender_pub_ed_b64);
           const ok = ed25519.verify(sigBytes, toVerify, sender_ed_pub);
 
@@ -161,29 +146,28 @@ export const fetchInbox = createAsyncThunk(
             from: bodyObj.sender_email || "(unknown)",
             ts: bodyObj.ts_client,
             msg_id: bodyObj.msg_id,
-            text: bodyObj.message
+            text: bodyObj.message,
+            direction: "in"
           });
         } catch (err) {
-          messages.push({ ok: false, error: String(err) });
-          dispatch(addLog({ level: "warn", msg: "Envelope decode failed", data: { error: String(err) } }));
+          messages.push({ ok: false, error: String(err), direction: "in" });
+          // optional log here
         }
-      }
-
-      if (messages.length) {
-        dispatch(addLog({ level: "info", msg: "Inbox processed", data: { count: messages.length } }));
       }
       return messages;
     } catch (e) {
-      dispatch(addLog({ level: "error", msg: "Fetch inbox failed", data: { error: String(e) } }));
       return rejectWithValue(String(e));
     }
   }
 );
 
-// --- Slice ---
+// --- slice ---
 const chatSlice = createSlice({
   name: "chat",
-  initialState: { threads: {} },
+  initialState: {
+    // threads: { key -> array of messages }
+    threads: {}
+  },
   reducers: {
     appendOutgoing(state, action) {
       const { toRcptId, body } = action.payload;
@@ -195,6 +179,20 @@ const chatSlice = createSlice({
         msg_id: body.msg_id,
         ok: true
       });
+    },
+    appendIncomingOne(state, action) {
+      const m = action.payload; // {from, ts, msg_id, text, ok, direction:"in"}
+      const key = m.from || "inbox";
+      if (!state.threads[key]) state.threads[key] = [];
+      state.threads[key].push(m);
+    },
+    appendIncomingBatch(state, action) {
+      const arr = action.payload || [];
+      for (const m of arr) {
+        const key = m.from || "inbox";
+        if (!state.threads[key]) state.threads[key] = [];
+        state.threads[key].push(m);
+      }
     }
   },
   extraReducers: (b) => {
@@ -204,11 +202,11 @@ const chatSlice = createSlice({
       for (const m of arr) {
         const key = m.from || "inbox";
         if (!s.threads[key]) s.threads[key] = [];
-        s.threads[key].push({ direction: "in", ...m });
+        s.threads[key].push(m);
       }
     });
   }
 });
 
-export const { appendOutgoing } = chatSlice.actions;
+export const { appendOutgoing, appendIncomingBatch, appendIncomingOne } = chatSlice.actions;
 export default chatSlice.reducer;

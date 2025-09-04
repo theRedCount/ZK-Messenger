@@ -13,8 +13,8 @@ import {
 import { setRuntimeKeys, clearRuntimeKeys, setDeterministicKeys } from "../../lib/runtime";
 import { apiRegister, apiLogin } from "../../services/api";
 import { signJWS } from "../../lib/jws";
+import { startInboxWS, stopInboxWS } from "../realtime/wsSlice";
 
-// ---------------- REGISTER ----------------
 export const registerUser = createAsyncThunk(
   "auth/registerUser",
   async ({ email, password }, { dispatch, rejectWithValue }) => {
@@ -22,18 +22,10 @@ export const registerUser = createAsyncThunk(
       dispatch(addLog({ level: "info", msg: "Registration started", data: { email } }));
       await readySodium();
 
-      // 1) deterministic keys
       const det = await deriveDeterministic(email, password);
-      dispatch(addLog({ level: "debug", msg: "Deterministic keys derived" }));
-
-      // 2) random registration keys
       const reg = await deriveRegistrationRandom();
-      dispatch(addLog({ level: "debug", msg: "Random registration keys derived" }));
-
-      // 3) seal master_random to deterministic X25519 public
       const c_master_b64 = toBase64(sealToX25519Pub(reg.master, det.xPub));
 
-      // 4) call backend
       const resp = await apiRegister({
         email,
         sign_pub_det_b64: toBase64(det.edPub),
@@ -41,12 +33,7 @@ export const registerUser = createAsyncThunk(
         c_master_b64
       });
 
-      dispatch(addLog({
-        level: "info",
-        msg: "User registered (backend)",
-        data: { email, rcpt_id: resp.rcpt_id }
-      }));
-
+      dispatch(addLog({ level: "info", msg: "User registered (backend)", data: { email, rcpt_id: resp.rcpt_id } }));
       return {
         email,
         rcpt_id: resp.rcpt_id,
@@ -61,7 +48,6 @@ export const registerUser = createAsyncThunk(
   }
 );
 
-// ---------------- LOGIN ----------------
 export const loginUser = createAsyncThunk(
   "auth/loginUser",
   async ({ email, password }, { dispatch, rejectWithValue }) => {
@@ -69,31 +55,20 @@ export const loginUser = createAsyncThunk(
       dispatch(addLog({ level: "info", msg: "Login started", data: { email } }));
       await readySodium();
 
-      // 1) derive deterministic
       const det = await deriveDeterministic(email, password);
       setDeterministicKeys(det);
-      dispatch(addLog({ level: "debug", msg: "Deterministic keys re-derived" }));
 
-      // 2) JWS login
       const token = signJWS({ email, act: "login" });
-      const rec = await apiLogin({ token, email }); // UserRecord (includes c_master_b64)
+      const rec = await apiLogin({ token, email }); // UserRecord (has rcpt_id, c_master_b64)
 
-      // 3) open sealed master with deterministic keys
       const master_random = unsealMasterWithDet(rec.c_master_b64, det);
-      dispatch(addLog({ level: "debug", msg: "Sealed master opened" }));
-
-      // 4) derive runtime keys and keep in memory
       const runtime = await deriveRuntimeFromMaster(master_random);
       setRuntimeKeys(runtime);
 
-      dispatch(addLog({
-        level: "info",
-        msg: "Login success",
-        data: {
-          email,
-          rcpt_id: rec.rcpt_id
-        }
-      }));
+      dispatch(addLog({ level: "info", msg: "Login success", data: { email, rcpt_id: rec.rcpt_id } }));
+
+      // ✅ start WS with explicit params
+      await dispatch(startInboxWS({ email, rcpt_id: rec.rcpt_id }));
 
       return {
         email,
@@ -110,7 +85,11 @@ export const loginUser = createAsyncThunk(
   }
 );
 
-// ---------------- SLICE ----------------
+export const logout = createAsyncThunk("auth/logout", async (_, { dispatch }) => {
+  await dispatch(stopInboxWS());
+  dispatch(resetAuth());
+});
+
 const initialState = {
   registering: false,
   loggingIn: false,

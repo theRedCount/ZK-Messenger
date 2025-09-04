@@ -118,7 +118,7 @@ async def post_message(envelope: EnvelopeIn, auth=Depends(auth_from_headers)):
 
     store.put_message(envelope)
     await manager.send_json(
-        envelope.rcpt_id, {"type": "envelope", "data": {**envelope.dict()}}
+        envelope.rcpt_id, {"type": "envelope", "data": envelope.model_dump(mode="json")}
     )
     return {"accepted": True}
 
@@ -177,7 +177,7 @@ async def ws_inbox(
         pending = store.fetch_inbox(rcpt_id)
         if pending:
             await ws.send_json(
-                {"type": "inbox.init", "data": [e.dict() for e in pending]}
+                {"type": "inbox.init", "data": [e.model_dump(mode="json") for e in pending]}
             )
 
         # Keepalive loop; client may send "ping" messages

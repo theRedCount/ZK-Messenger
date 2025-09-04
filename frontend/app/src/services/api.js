@@ -16,7 +16,7 @@ export async function apiRegister({ email, sign_pub_det_b64, enc_pub_rand_b64, c
     body: JSON.stringify({ email, sign_pub_det_b64, enc_pub_rand_b64, c_master_b64 })
   });
   if (!res.ok) throw new Error(await res.text());
-  return res.json(); // { email, rcpt_id, enc_pub_rand_b64, sign_pub_det_b64 }
+  return res.json();
 }
 
 export async function apiLogin({ token, email }) {
@@ -25,13 +25,13 @@ export async function apiLogin({ token, email }) {
     headers: { ...authHeaders({ token, email }) }
   });
   if (!res.ok) throw new Error(await res.text());
-  return res.json(); // UserRecord (includes c_master_b64)
+  return res.json();
 }
 
 export async function apiListUsers({ token, email }) {
   const res = await fetch(`${BASE}/users`, { headers: { ...authHeaders({ token, email }) } });
   if (!res.ok) throw new Error(await res.text());
-  return res.json(); // UserOut[]
+  return res.json();
 }
 
 export async function apiPostMessage({ token, email, envelope }) {
@@ -49,20 +49,22 @@ export async function apiFetchInbox({ token, email, rcpt_id }) {
   url.searchParams.set("rcpt_id", rcpt_id);
   const res = await fetch(url.toString(), { headers: { ...authHeaders({ token, email }) } });
   if (!res.ok) throw new Error(await res.text());
-  return res.json(); // EnvelopeStored[]
+  return res.json();
 }
 
 // -------- WebSocket --------
 export function connectInboxWS({ token, email, onInit, onEnvelope, onClose }) {
   const wsUrl = `${BASE.replace("http", "ws")}/ws/inbox?token=${encodeURIComponent(token)}&email=${encodeURIComponent(email)}`;
   const ws = new WebSocket(wsUrl);
+  ws.onopen = () => { try { ws.send("ping"); } catch {} };
   ws.onmessage = (evt) => {
-    const msg = JSON.parse(evt.data);
-    if (msg.type === "inbox.init") onInit?.(msg.data);
-    else if (msg.type === "envelope") onEnvelope?.(msg.data);
+    try {
+      const msg = JSON.parse(evt.data);
+      if (msg.type === "inbox.init") onInit?.(msg.data);
+      else if (msg.type === "envelope") onEnvelope?.(msg.data);
+    } catch {}
   };
   ws.onclose = () => onClose?.();
-  ws.onopen = () => ws.send("ping");
   ws.onerror = () => {};
   return ws;
 }
